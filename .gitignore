@@ -30,6 +30,9 @@ ENV/
 .ipynb_checkpoints
 *.ipynb_checkpoints/
 
+# Environment variables (secrets)
+.env
+
 # Models et Checkpoints (trop volumineux pour Git)
 models/**/*.pt
 models/**/*.pth
@@ -39,11 +42,9 @@ models/**/*.pth
 outputs/*.txt
 !outputs/.gitkeep
 
-# Datasets (peut être volumineux)
-data/*.jsonl
-data/*.json
-data/*.csv
+# Datasets - Inclure les données
 !data/.gitkeep
+!data/*.jsonl
 
 # Logs
 *.log
