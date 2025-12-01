@@ -10,12 +10,14 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import numpy as np
-from transformers import GPT2Tokenizer
+from transformers import AutoTokenizer
 import time
 import plotly.graph_objects as go
 import plotly.express as px
 from pathlib import Path
 import json
+import math
+from dataclasses import dataclass
 
 # ============================================================================
 # CONFIGURATION DE LA PAGE
@@ -63,7 +65,7 @@ st.markdown("""
     }
     
     .post-training {
-        background: linear-gradient(135deg, #f093fb22 0%, #f5576c22 100%);
+        background: linear-gradient(135deg, #f093fb22 0% , #f5576c22 100%);
         border-left: 4px solid #f093fb;
     }
     
@@ -107,134 +109,112 @@ st.markdown("""
             opacity: 1;
         }
     }
-    
-    .spinner {
-        border: 4px solid #f3f3f3;
-        border-top: 4px solid #667eea;
-        border-radius: 50%;
-        width: 40px;
-        height: 40px;
-        animation: spin 1s linear infinite;
-        margin: 20px auto;
-    }
-    
-    @keyframes spin {
-        0% { transform: rotate(0deg); }
-        100% { transform: rotate(360deg); }
-    }
 </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# ARCHITECTURE DU MODÈLE (copie depuis les notebooks)
+# MODEL ARCHITECTURE - Exact copy from notebooks
 # ============================================================================
 
+@dataclass
+class ModelConfig:
+    vocab_size: int = 50257
+    d_model: int = 512
+    n_heads: int = 8
+    n_layers: int = 8
+    d_ff: int = 2048
+    block_size: int = 256
+
+
 class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd, n_head, block_size, dropout):
+    def __init__(self, d_model, n_heads, block_size):
         super().__init__()
-        assert n_embd % n_head == 0
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
-        self.c_proj = nn.Linear(n_embd, n_embd)
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-        self.n_head = n_head
-        self.n_embd = n_embd
-        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
-                                     .view(1, 1, block_size, block_size))
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+
+        mask = torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size)
+        self.register_buffer("mask", mask)
 
     def forward(self, x):
-        B, T, C = x.size()
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / np.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        B, T, C = x.shape
+        qkv = self.qkv(x)
+        q, k, v = qkv.split(C, dim=2)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
         att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
         y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        return self.proj(y)
 
-class MLP(nn.Module):
-    def __init__(self, n_embd, dropout):
+
+class Block(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, block_size):
         super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4 * n_embd)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * n_embd, n_embd)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class TransformerBlock(nn.Module):
-    def __init__(self, n_embd, n_head, block_size, dropout):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.mlp = MLP(n_embd, dropout)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_heads, block_size)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+        )
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.ff(self.ln2(x))
         return x
 
-class MiniGPT(nn.Module):
-    def __init__(self, vocab_size, block_size, n_embd, n_head, n_layer, dropout):
+
+class TinyDecoderLM(nn.Module):
+    def __init__(self, cfg):
         super().__init__()
-        self.block_size = block_size
-        self.token_embedding = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding = nn.Embedding(block_size, n_embd)
-        self.drop = nn.Dropout(dropout)
-        self.blocks = nn.Sequential(*[
-            TransformerBlock(n_embd, n_head, block_size, dropout) 
-            for _ in range(n_layer)
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.pos_emb = nn.Embedding(cfg.block_size, cfg.d_model)
+        self.blocks = nn.ModuleList([
+            Block(cfg.d_model, cfg.n_heads, cfg.d_ff, cfg.block_size)
+            for _ in range(cfg.n_layers)
         ])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-        self.token_embedding.weight = self.lm_head.weight
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    
+        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        assert T <= self.block_size
-        tok_emb = self.token_embedding(idx)
-        pos_emb = self.position_embedding(torch.arange(T, device=idx.device))
-        x = self.drop(tok_emb + pos_emb)
-        x = self.blocks(x)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
+        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
+        x = self.tok_emb(idx) + self.pos_emb(pos)
         
+        for blk in self.blocks:
+            x = blk(x)
+        
+        x = self.ln_f(x)
+        logits = self.head(x)
+        
+        loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        else:
-            loss = None
+            loss = F.cross_entropy(
+                logits.view(-1, self.cfg.vocab_size),
+                targets.view(-1),
+                ignore_index=-100
+            )
         
         return logits, loss
     
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         for _ in range(max_new_tokens):
-            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+            idx_cond = idx[:, -self.cfg.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
             
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                logits[logits < v[:, [-1]]] = float('-inf')
             
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
@@ -242,56 +222,286 @@ class MiniGPT(nn.Module):
         
         return idx
 
+
 # ============================================================================
-# CACHE DES MODÈLES
+# CUSTOM DECODER - Avoid TensorFlow/Tokenizer decode issues
 # ============================================================================
-@st.cache_resource
-def load_model(model_path, tokenizer_path, model_name):
-    """Charge un modèle et son tokenizer avec mise en cache"""
+
+def safe_decode_tokens(token_ids, tokenizer):
+    """
+    Decode token IDs to text without using tokenizer.decode() which triggers TensorFlow.
+    Falls back to manual vocabulary lookup.
+    """
     try:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Get the vocab dictionary directly
+        vocab = tokenizer.get_vocab()
+        id_to_token = {v: k for k, v in vocab.items()}
         
-        # Charger le tokenizer
-        tokenizer = GPT2Tokenizer.from_pretrained(tokenizer_path)
+        # Convert IDs to tokens using vocabulary
+        tokens = []
+        for token_id in token_ids:
+            token_id = int(token_id)
+            if token_id in id_to_token:
+                token = id_to_token[token_id]
+                tokens.append(token)
+            else:
+                # Fallback for unknown tokens
+                tokens.append(f"<unk:{token_id}>")
+        
+        # Join tokens with special handling for BPE tokens
+        text = ""
+        for token in tokens:
+            if token.startswith("Ġ"):  # GPT-2 BPE space token
+                text += " " + token[1:]
+            elif token.startswith("##"):  # WordPiece continuation
+                text += token[2:]
+            else:
+                text += token
+        
+        return text.strip()
+    except Exception as e:
+        # Last resort: return token IDs as string
+        return f"[Tokens: {token_ids[:50]}...]"
+
+# ============================================================================
+# MODEL LOADING FUNCTION - Updated for notebook format
+# ============================================================================
+
+@st.cache_resource
+def load_model(model_path, tokenizer_path, model_name, device):
+    """
+    Charge un modèle et son tokenizer avec mise en cache
+    Compatible avec les checkpoints des notebooks
+    Gère à la fois Pre-Training et Post-Training (SFT)
+    """
+    try:
+        # ====================================================================
+        # 1. CHARGER LE TOKENIZER
+        # ====================================================================
+        st.write(f"📖 Chargement tokenizer depuis: {tokenizer_path}")
+        
+        # Vérifier si le chemin existe
+        from pathlib import Path
+        tok_path = Path(tokenizer_path)
+        if not tok_path.exists():
+            st.error(f"❌ Tokenizer introuvable: {tokenizer_path}")
+            return None, None, None, None
+        
+        # Charger le tokenizer - supporte BPE et HuggingFace formats
+        tokenizer = None
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        except Exception as e:
+            st.warning(f"⚠️  AutoTokenizer échoué: {str(e)[:80]}...")
+            st.info(f"💡 Essai avec EleutherAI/gpt-neox-20b comme source...")
+            try:
+                # The notebook loads from EleutherAI directly - use that as fallback
+                tokenizer = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b')
+                st.info(f"✅ Tokenizer EleutherAI chargé avec succès")
+            except:
+                st.warning(f"⚠️  EleutherAI échoué, essai du pre-training tokenizer...")
+                try:
+                    # Use pre-training tokenizer as final fallback for SFT
+                    default_tokenizer_path = "models/pre_training/tokenizer"
+                    tokenizer = AutoTokenizer.from_pretrained(default_tokenizer_path)
+                    st.info(f"✅ Tokenizer pre-training utilisé comme fallback")
+                except:
+                    st.error(f"❌ Impossible de charger le tokenizer")
+                    return None, None, None, None
+        
+        if tokenizer is None:
+            st.error(f"❌ Tokenizer est None")
+            return None, None, None, None
+        
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Charger le checkpoint
+        vocab_size = len(tokenizer)
+        st.success(f"✅ Tokenizer chargé ({vocab_size:,} tokens)")
+        
+        # ====================================================================
+        # 2. CHARGER LE CHECKPOINT
+        # ====================================================================
+        st.write(f"📦 Chargement checkpoint: {model_path}")
+        
+        # Vérifier si le checkpoint existe
+        model_file = Path(model_path)
+        if not model_file.exists():
+            st.error(f"❌ Checkpoint introuvable: {model_path}")
+            return None, None, None, None
+        
         checkpoint = torch.load(model_path, map_location=device)
-        config = checkpoint['config']
         
-        # Créer le modèle
-        model = MiniGPT(
-            vocab_size=config['vocab_size'],
-            block_size=config['block_size'],
-            n_embd=config['n_embd'],
-            n_head=config['n_head'],
-            n_layer=config['n_layer'],
-            dropout=config['dropout']
-        ).to(device)
+        # Afficher la structure du checkpoint pour debug
+        checkpoint_keys = list(checkpoint.keys()) if isinstance(checkpoint, dict) else ['<direct_tensor>']
+        st.write(f"🔍 Clés du checkpoint: {checkpoint_keys[:10]}...")
         
-        # Charger les poids
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # Determine vocabulary size from checkpoint if available
+        checkpoint_vocab_size = None
+        if isinstance(checkpoint, dict) and 'config' in checkpoint:
+            checkpoint_vocab_size = checkpoint['config'].get('vocab_size')
+        
+        # Use checkpoint vocab size if different from tokenizer
+        # (this handles the SFT case where model was trained with special tokens)
+        if checkpoint_vocab_size and checkpoint_vocab_size != vocab_size:
+            original_vocab_size = vocab_size
+            vocab_size = checkpoint_vocab_size
+            st.info(f"💡 Vocab size ajusté: {original_vocab_size} -> {vocab_size} (depuis checkpoint)")
+        
+        # ====================================================================
+        # 3. EXTRAIRE LA CONFIGURATION
+        # ====================================================================
+        # Le checkpoint peut être:
+        # 1. Un dict avec 'model_state_dict' et 'config' (Post-Training)
+        # 2. Un dict avec 'model_state_dict' directement (Pre-Training final) 
+        # 3. Un dict de poids (weights only - Pre-Training raw)
+        
+        if isinstance(checkpoint, dict) and 'config' in checkpoint:
+            # Format 1: Checkpoint structuré avec config
+            config_dict = checkpoint['config']
+            model_state = checkpoint.get('model_state_dict', checkpoint)
+        elif isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            # Format 2: Checkpoint avec model_state_dict mais sans config
+            config_dict = checkpoint.get('config', {})
+            model_state = checkpoint['model_state_dict']
+        else:
+            # Format 3: Weights only ou state_dict direct
+            config_dict = {}
+            model_state = checkpoint
+        
+        # Map config keys intelligemment (Pre-Training vs Post-Training)
+        # Pre-Training: n_embd, n_head, n_layer, dropout
+        # Post-Training: d_model, n_head, n_layer, d_ff
+        d_model = config_dict.get('d_model') or config_dict.get('n_embd', 512)
+        n_heads = config_dict.get('n_head', config_dict.get('n_heads', 8))
+        n_layers = config_dict.get('n_layer', config_dict.get('n_layers', 8))
+        d_ff = config_dict.get('d_ff', 2048)
+        block_size = config_dict.get('block_size', 256)
+        
+        config = ModelConfig(
+            vocab_size=vocab_size,  # Toujours utiliser vocab_size du tokenizer !
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers=n_layers,
+            d_ff=d_ff,
+            block_size=block_size,
+        )
+        
+        st.write(f"📊 Config du modèle:")
+        st.write(f"   • d_model={config.d_model}, n_heads={config.n_heads}, n_layers={config.n_layers}")
+        st.write(f"   • block_size={config.block_size}, d_ff={config.d_ff}")
+        
+        # ====================================================================
+        # 4. CRÉER ET CHARGER LE MODÈLE
+        # ====================================================================
+        model = TinyDecoderLM(config).to(device)
+        
+        # Charger les poids depuis le checkpoint
+        try:
+            model.load_state_dict(model_state)
+        except RuntimeError as e:
+            if 'size mismatch' in str(e) and 'tok_emb' in str(e):
+                # Vocab size mismatch - adjust embeddings (like notebook does)
+                st.info(f"💡 Ajustement du vocabulaire détecté...")
+                old_tok_emb = model_state.get('tok_emb.weight')
+                if old_tok_emb is not None:
+                    old_vocab_size = old_tok_emb.shape[0]
+                    new_vocab_size = config.vocab_size
+                    st.write(f"   • Ancien vocab: {old_vocab_size}, Nouveau vocab: {new_vocab_size}")
+                    
+                    # Expand embeddings with new tokens
+                    new_tok_emb = model.tok_emb.weight.data.clone()
+                    new_tok_emb[:old_vocab_size] = old_tok_emb
+                    model.tok_emb.weight.data = new_tok_emb
+                    
+                    # Update head weights (weight tying)
+                    model.head.weight.data = new_tok_emb
+                    
+                    # Update state dict for loading
+                    model_state['tok_emb.weight'] = new_tok_emb
+                    model_state['head.weight'] = new_tok_emb
+                    
+                    model.load_state_dict(model_state, strict=False)
+                    st.success(f"✅ Vocabulaire ajusté")
+                else:
+                    raise e
+            else:
+                raise e
+        
         model.eval()
         
-        # Extraire les métriques
+        total_params = sum(p.numel() for p in model.parameters())
+        st.success(f"✅ Modèle chargé ({total_params:,} paramètres)")
+        
+        # ====================================================================
+        # 5. EXTRAIRE LES MÉTRIQUES
+        # ====================================================================
+        history = checkpoint.get('history', {})
+        
+        # Extraire val_loss et train_loss de manière robuste
+        val_loss = 'N/A'
+        if history and isinstance(history.get('val_loss'), list) and len(history['val_loss']) > 0:
+            val_loss = float(history['val_loss'][-1])
+        elif 'best_val_loss' in checkpoint:
+            val_loss = float(checkpoint['best_val_loss'])
+        
+        train_loss = 'N/A'
+        if history and isinstance(history.get('train_loss'), list) and len(history['train_loss']) > 0:
+            train_loss = float(history['train_loss'][-1])
+        
         metrics = {
             'epoch': checkpoint.get('epoch', 'N/A'),
-            'val_loss': checkpoint['history']['val_loss'][-1] if 'history' in checkpoint else 'N/A',
-            'perplexity': np.exp(checkpoint['history']['val_loss'][-1]) if 'history' in checkpoint else 'N/A',
-            'params': sum(p.numel() for p in model.parameters()),
+            'val_loss': val_loss,
+            'train_loss': train_loss,
+            'params': total_params,
+            'training_stage': checkpoint.get('training_stage', 'unknown'),
+            'selected_from_epoch': checkpoint.get('selected_from_epoch', 'N/A'),
+            'best_val_loss': checkpoint.get('best_val_loss', 'N/A'),
         }
         
+        # Calculer perplexity
+        if isinstance(metrics['val_loss'], float):
+            metrics['perplexity'] = np.exp(metrics['val_loss'])
+        else:
+            metrics['perplexity'] = 'N/A'
+        
+        st.success(f"✅ Métriques: val_loss={metrics['val_loss']}, epoch={metrics['epoch']}")
+        
         return model, tokenizer, device, metrics
+        
+    except FileNotFoundError as e:
+        st.error(f"❌ Fichier non trouvé: {str(e)}")
+        st.error(f"📂 Vérifiez les chemins: {model_path}, {tokenizer_path}")
+        return None, None, None, None
+    except RuntimeError as e:
+        st.error(f"❌ Erreur à la charge du modèle: {str(e)}")
+        st.info(f"💡 Conseil: Assurez-vous que la config correspond aux poids sauvegardés")
+        return None, None, None, None
     except Exception as e:
         st.error(f"❌ Erreur lors du chargement de {model_name}: {str(e)}")
+        st.error(f"📂 Vérifiez le chemin: {model_path}")
+        import traceback
+        st.code(traceback.format_exc())
         return None, None, None, None
+
 
 @st.cache_data
 def generate_code(_model, _tokenizer, _device, prompt, max_tokens=150, temperature=0.7, top_k=50):
-    """Génère du code avec un modèle"""
+    """
+    Génère du code avec un modèle
+    Accepte les tokens comme premier argument pour bypass du cache
+    """
     try:
-        input_ids = _tokenizer.encode(prompt, return_tensors='pt').to(_device)
+        # Encoder le prompt
+        encoded = _tokenizer.encode(prompt)
+        if not encoded:
+            return "❌ Erreur: Le prompt n'a pas pu être encodé", 0.0
+        
+        input_ids = torch.tensor([encoded], device=_device)
+        
+        # Vérifier que le tensor n'est pas vide
+        if input_ids.numel() == 0:
+            return "❌ Erreur: Prompt vide après encodage", 0.0
         
         with torch.no_grad():
             start_time = time.time()
@@ -303,17 +513,27 @@ def generate_code(_model, _tokenizer, _device, prompt, max_tokens=150, temperatu
             )
             generation_time = time.time() - start_time
         
-        generated_text = _tokenizer.decode(output_ids[0].tolist())
+        
+        # Decode using custom function that avoids TensorFlow
+        generated_text = safe_decode_tokens(output_ids[0].tolist(), _tokenizer)
         
         return generated_text, generation_time
     except Exception as e:
-        return f"Erreur: {str(e)}", 0.0
+        import traceback
+        error_msg = f"❌ Erreur: {str(e)[:100]}"
+        return error_msg, 0.0
+
 
 # ============================================================================
-# HEADER PRINCIPAL
+# MAIN UI
 # ============================================================================
+
 st.markdown('<h1 class="main-header">🧠 LLM Coding Assistant Dashboard</h1>', unsafe_allow_html=True)
 st.markdown("---")
+
+# Détection device
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+st.sidebar.info(f"🚀 Device: {device.upper()}")
 
 # ============================================================================
 # SIDEBAR - CONFIGURATION
@@ -327,38 +547,41 @@ with st.sidebar:
     top_k = st.slider("Top-K", 10, 100, 50, 5)
     
     st.markdown("---")
-    st.markdown("### 📊 Modèles Disponibles")
+    st.markdown("### 📊 Modèles à Charger")
     
     show_pretrained = st.checkbox("✅ Pre-Training", value=True)
     show_sft = st.checkbox("✅ Post-Training (SFT)", value=True)
-    show_alignment = st.checkbox("⚠️ Alignment (RLHF)", value=False, 
-                                  help="Non disponible pour l'instant")
     
     st.markdown("---")
     st.markdown("### 📁 Chemins des Modèles")
     
+    # Chemins relatifs par défaut (depuis le répertoire courant)
     pretrained_path = st.text_input(
-        "Pre-Training",
-        "models/pre_training/mini_gpt_code_FINAL.pt"
+        "Pre-Training Model",
+        "models/pre_training/model_final.pt",
+        help="Chemin relatif ou absolu au checkpoint pre-training"
+    )
+    
+    pretrained_tokenizer = st.text_input(
+        "Pre-Training Tokenizer",
+        "models/pre_training/tokenizer",
+        help="Dossier contenant le tokenizer pre-training"
     )
     
     sft_path = st.text_input(
-        "Post-Training",
-        "models/post_training/mini_gpt_sft_FINAL.pt"
+        "Post-Training Model",
+        "models/post_training/model_sft_FINAL.pt",
+        help="Chemin relatif ou absolu au checkpoint SFT final"
     )
     
-    alignment_path = st.text_input(
-        "Alignment",
-        "models/alignment/mini_gpt_rlhf_FINAL.pt",
-        disabled=True
+    sft_tokenizer = st.text_input(
+        "Post-Training Tokenizer",
+        "models/post_training/tokenizer",
+        help="Dossier contenant le tokenizer post-training"
     )
-    
-    st.markdown("---")
-    st.markdown("### ℹ️ Info")
-    st.info("Équipe IRA - Workshop LLM\n\nDate: 29 Nov 2025")
 
 # ============================================================================
-# SECTION PRINCIPALE - INPUT
+# MAIN CONTENT - INPUT
 # ============================================================================
 st.markdown("## 💬 Entrez votre Prompt")
 
@@ -374,16 +597,27 @@ with col1:
 
 with col2:
     st.markdown("### 📝 Exemples")
-    if st.button("🔢 Fibonacci"):
-        prompt_input = "def fibonacci(n):"
-    if st.button("🧮 Factorial"):
-        prompt_input = "<instruction> Write a function to calculate factorial <reasoning>"
-    if st.button("🔍 Binary Search"):
-        prompt_input = "<instruction> Implement binary search algorithm <reasoning>"
-    if st.button("🔄 QuickSort"):
-        prompt_input = "def quicksort(arr):"
+    
+    col_ex1, col_ex2 = st.columns(2)
+    with col_ex1:
+        if st.button("Fibonacci"):
+            st.session_state.prompt = "def fibonacci(n):"
+    with col_ex2:
+        if st.button("Factorial (SFT)"):
+            st.session_state.prompt = "<instruction> Write a function to calculate factorial <reasoning>"
+    
+    col_ex3, col_ex4 = st.columns(2)
+    with col_ex3:
+        if st.button("Binary Search"):
+            st.session_state.prompt = "<instruction> Implement binary search algorithm <reasoning>"
+    with col_ex4:
+        if st.button("Reverse List"):
+            st.session_state.prompt = "<instruction> Create a function to reverse a list <reasoning>"
+    
+    if 'prompt' in st.session_state:
+        prompt_input = st.session_state.prompt
 
-generate_button = st.button("🚀 Générer avec tous les modèles", type="primary", use_container_width=True)
+generate_button = st.button("🚀 Générer", type="primary", use_container_width=True)
 
 # ============================================================================
 # GÉNÉRATION ET COMPARAISON
@@ -393,29 +627,30 @@ if generate_button and prompt_input:
     st.markdown("---")
     st.markdown("## 🔬 Comparaison des Modèles")
     
-    # Barre de progression
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
     results = {}
-    total_models = sum([show_pretrained, show_sft, show_alignment])
-    current_step = 0
+    
+    # Container for status
+    status_container = st.container()
+    progress_container = st.container()
     
     # ========================================================================
     # MODÈLE 1: PRE-TRAINING
     # ========================================================================
     if show_pretrained:
-        status_text.text("⏳ Chargement du modèle Pre-Training...")
-        progress_bar.progress(current_step / total_models)
+        with status_container:
+            st.info("⏳ Chargement Pre-Training...")
         
         model_pre, tokenizer_pre, device_pre, metrics_pre = load_model(
             pretrained_path,
-            "models/pre_training/tokenizer",
-            "Pre-Training"
+            pretrained_tokenizer,
+            "Pre-Training",
+            device
         )
         
         if model_pre is not None:
-            status_text.text("🔄 Génération avec Pre-Training...")
+            with status_container:
+                st.info("🔄 Génération avec Pre-Training...")
+            
             generated_pre, time_pre = generate_code(
                 model_pre, tokenizer_pre, device_pre,
                 prompt_input, max_tokens, temperature, top_k
@@ -426,25 +661,25 @@ if generate_button and prompt_input:
                 'time': time_pre,
                 'metrics': metrics_pre
             }
-        
-        current_step += 1
-        progress_bar.progress(current_step / total_models)
     
     # ========================================================================
     # MODÈLE 2: POST-TRAINING (SFT)
     # ========================================================================
     if show_sft:
-        status_text.text("⏳ Chargement du modèle Post-Training...")
-        progress_bar.progress(current_step / total_models)
+        with status_container:
+            st.info("⏳ Chargement Post-Training (SFT)...")
         
         model_sft, tokenizer_sft, device_sft, metrics_sft = load_model(
             sft_path,
-            "models/post_training/tokenizer",
-            "Post-Training"
+            sft_tokenizer,
+            "Post-Training (SFT)",
+            device
         )
         
         if model_sft is not None:
-            status_text.text("🔄 Génération avec Post-Training...")
+            with status_container:
+                st.info("🔄 Génération avec Post-Training...")
+            
             generated_sft, time_sft = generate_code(
                 model_sft, tokenizer_sft, device_sft,
                 prompt_input, max_tokens, temperature, top_k
@@ -455,171 +690,156 @@ if generate_button and prompt_input:
                 'time': time_sft,
                 'metrics': metrics_sft
             }
-        
-        current_step += 1
-        progress_bar.progress(current_step / total_models)
     
-    # ========================================================================
-    # MODÈLE 3: ALIGNMENT (RLHF) - Placeholder
-    # ========================================================================
-    if show_alignment:
-        results['alignment'] = {
-            'output': "⚠️ Modèle RLHF non encore entraîné.\n\nProchaines étapes:\n- Collecte de préférences humaines\n- Entraînement du reward model\n- Optimisation PPO",
-            'time': 0.0,
-            'metrics': {'epoch': 'N/A', 'val_loss': 'N/A', 'perplexity': 'N/A', 'params': 'N/A'}
+    # Clear status
+    status_container.empty()
+    progress_container.empty()
+    
+    if results:
+        st.success("✅ Génération terminée !")
+        
+        # ====================================================================
+        # AFFICHAGE DES RÉSULTATS
+        # ====================================================================
+        st.markdown("### 📊 Résultats")
+        
+        model_styles = {
+            'pre': ('pre-training', '🔵 Pre-Training', '#667eea'),
+            'sft': ('post-training', '🟣 Post-Training (SFT)', '#f093fb'),
         }
-    
-    progress_bar.progress(1.0)
-    status_text.text("✅ Génération terminée !")
-    time.sleep(0.5)
-    progress_bar.empty()
-    status_text.empty()
-    
-    # ========================================================================
-    # AFFICHAGE DES RÉSULTATS
-    # ========================================================================
-    st.markdown("### 📊 Résultats")
-    
-    # Créer les colonnes selon les modèles actifs
-    cols = st.columns(len(results))
-    
-    # Mapping des styles
-    model_styles = {
-        'pre': ('pre-training', '🔵 Pre-Training', '#667eea'),
-        'sft': ('post-training', '🟣 Post-Training (SFT)', '#f093fb'),
-        'alignment': ('alignment', '🔷 Alignment (RLHF)', '#4facfe')
-    }
-    
-    for idx, (model_key, result) in enumerate(results.items()):
-        with cols[idx]:
-            style_class, title, color = model_styles[model_key]
-            
-            st.markdown(f'<div class="model-card {style_class}">', unsafe_allow_html=True)
-            st.markdown(f"### {title}")
-            
-            # Métriques
-            metrics = result['metrics']
-            col_m1, col_m2 = st.columns(2)
-            with col_m1:
-                st.metric("⏱️ Temps", f"{result['time']:.2f}s")
-                st.metric("📊 Epoch", str(metrics['epoch']))
-            with col_m2:
-                if isinstance(metrics['val_loss'], float):
-                    st.metric("📉 Val Loss", f"{metrics['val_loss']:.4f}")
-                else:
-                    st.metric("📉 Val Loss", str(metrics['val_loss']))
+        
+        cols = st.columns(len(results))
+        
+        for idx, (model_key, result) in enumerate(results.items()):
+            with cols[idx]:
+                style_class, title, color = model_styles[model_key]
                 
-                if isinstance(metrics['perplexity'], float):
-                    st.metric("🎯 Perplexity", f"{metrics['perplexity']:.2f}")
-                else:
-                    st.metric("🎯 Perplexity", str(metrics['perplexity']))
+                st.markdown(f'<div class="model-card {style_class}">', unsafe_allow_html=True)
+                st.markdown(f"### {title}")
+                
+                # Métriques
+                metrics = result['metrics']
+                
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    st.metric("⏱️ Temps", f"{result['time']:.3f}s")
+                    st.metric("📅 Epoch", str(metrics['epoch']))
+                
+                with col_m2:
+                    val_loss = metrics.get('val_loss')
+                    if isinstance(val_loss, float):
+                        st.metric("📉 Val Loss", f"{val_loss:.4f}")
+                    else:
+                        st.metric("📉 Val Loss", "N/A")
+                    
+                    perp = metrics.get('perplexity')
+                    if isinstance(perp, float):
+                        st.metric("🎯 Perplexity", f"{perp:.2f}")
+                    else:
+                        st.metric("🎯 Perplexity", "N/A")
+                
+                # Stage info
+                st.caption(f"Stage: {metrics.get('training_stage', 'N/A')}")
+                
+                # Code généré
+                st.markdown("**📝 Sortie générée:**")
+                st.markdown(f'<div class="code-output">{result["output"]}</div>', unsafe_allow_html=True)
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+        
+        # ====================================================================
+        # GRAPHIQUES COMPARATIFS
+        # ====================================================================
+        st.markdown("---")
+        st.markdown("### 📈 Analyses Comparatives")
+        
+        tab1, tab2, tab3 = st.tabs(["⏱️ Performance", "📊 Métriques", "📏 Longueur"])
+        
+        with tab1:
+            fig_time = go.Figure()
+            for model_key, result in results.items():
+                _, title, color = model_styles[model_key]
+                fig_time.add_trace(go.Bar(
+                    name=title,
+                    x=[title],
+                    y=[result['time']],
+                    marker_color=color,
+                    text=[f"{result['time']:.3f}s"],
+                    textposition='auto'
+                ))
             
-            # Code généré
-            st.markdown("**Sortie générée:**")
-            st.markdown(f'<div class="code-output">{result["output"]}</div>', unsafe_allow_html=True)
+            fig_time.update_layout(
+                title="⏱️ Temps de Génération",
+                yaxis_title="Temps (secondes)",
+                showlegend=False,
+                height=400
+            )
+            st.plotly_chart(fig_time, use_container_width=True)
+        
+        with tab2:
+            metrics_data = []
+            for model_key, result in results.items():
+                _, title, _ = model_styles[model_key]
+                m = result['metrics']
+                val_loss = m.get('val_loss')
+                perp = m.get('perplexity')
+                if isinstance(val_loss, float) and isinstance(perp, float):
+                    metrics_data.append({
+                        'Modèle': title,
+                        'Validation Loss': val_loss,
+                        'Perplexity': perp
+                    })
             
-            st.markdown('</div>', unsafe_allow_html=True)
-    
-    # ========================================================================
-    # GRAPHIQUES COMPARATIFS
-    # ========================================================================
-    st.markdown("---")
-    st.markdown("### 📈 Analyses Comparatives")
-    
-    tab1, tab2, tab3 = st.tabs(["⏱️ Performance", "📊 Métriques", "📏 Longueur"])
-    
-    with tab1:
-        # Graphique des temps de génération
-        fig_time = go.Figure()
+            if metrics_data:
+                col_g1, col_g2 = st.columns(2)
+                
+                with col_g1:
+                    fig_loss = px.bar(
+                        metrics_data,
+                        x='Modèle',
+                        y='Validation Loss',
+                        title='📉 Validation Loss'
+                    )
+                    st.plotly_chart(fig_loss, use_container_width=True)
+                
+                with col_g2:
+                    fig_perp = px.bar(
+                        metrics_data,
+                        x='Modèle',
+                        y='Perplexity',
+                        title='🎯 Perplexity'
+                    )
+                    st.plotly_chart(fig_perp, use_container_width=True)
         
-        for model_key, result in results.items():
-            _, title, color = model_styles[model_key]
-            fig_time.add_trace(go.Bar(
-                name=title,
-                x=[title],
-                y=[result['time']],
-                marker_color=color,
-                text=[f"{result['time']:.2f}s"],
-                textposition='auto'
-            ))
-        
-        fig_time.update_layout(
-            title="⏱️ Temps de Génération par Modèle",
-            yaxis_title="Temps (secondes)",
-            showlegend=False,
-            height=400
-        )
-        
-        st.plotly_chart(fig_time, use_container_width=True)
-    
-    with tab2:
-        # Comparaison des métriques
-        metrics_data = []
-        for model_key, result in results.items():
-            _, title, _ = model_styles[model_key]
-            m = result['metrics']
-            if isinstance(m['val_loss'], float) and isinstance(m['perplexity'], float):
-                metrics_data.append({
+        with tab3:
+            length_data = []
+            for model_key, result in results.items():
+                _, title, _ = model_styles[model_key]
+                length_data.append({
                     'Modèle': title,
-                    'Validation Loss': m['val_loss'],
-                    'Perplexity': m['perplexity']
+                    'Caractères': len(result['output']),
+                    'Lignes': result['output'].count('\n') + 1
                 })
-        
-        if metrics_data:
-            col_g1, col_g2 = st.columns(2)
             
-            with col_g1:
-                fig_loss = px.bar(
-                    metrics_data,
-                    x='Modèle',
-                    y='Validation Loss',
-                    title='📉 Validation Loss',
-                    color='Modèle'
-                )
-                st.plotly_chart(fig_loss, use_container_width=True)
+            col_l1, col_l2 = st.columns(2)
             
-            with col_g2:
-                fig_perp = px.bar(
-                    metrics_data,
+            with col_l1:
+                fig_chars = px.bar(
+                    length_data,
                     x='Modèle',
-                    y='Perplexity',
-                    title='🎯 Perplexity',
-                    color='Modèle'
+                    y='Caractères',
+                    title='📏 Longueur en Caractères'
                 )
-                st.plotly_chart(fig_perp, use_container_width=True)
-    
-    with tab3:
-        # Longueur des sorties
-        length_data = []
-        for model_key, result in results.items():
-            _, title, _ = model_styles[model_key]
-            length_data.append({
-                'Modèle': title,
-                'Nombre de caractères': len(result['output']),
-                'Nombre de lignes': result['output'].count('\n') + 1
-            })
-        
-        col_l1, col_l2 = st.columns(2)
-        
-        with col_l1:
-            fig_chars = px.bar(
-                length_data,
-                x='Modèle',
-                y='Nombre de caractères',
-                title='📏 Longueur en Caractères',
-                color='Modèle'
-            )
-            st.plotly_chart(fig_chars, use_container_width=True)
-        
-        with col_l2:
-            fig_lines = px.bar(
-                length_data,
-                x='Modèle',
-                y='Nombre de lignes',
-                title='📄 Nombre de Lignes',
-                color='Modèle'
-            )
-            st.plotly_chart(fig_lines, use_container_width=True)
+                st.plotly_chart(fig_chars, use_container_width=True)
+            
+            with col_l2:
+                fig_lines = px.bar(
+                    length_data,
+                    x='Modèle',
+                    y='Lignes',
+                    title='📄 Nombre de Lignes'
+                )
+                st.plotly_chart(fig_lines, use_container_width=True)
 
 # ============================================================================
 # FOOTER
@@ -628,7 +848,7 @@ st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
     <p>🧠 <b>Workshop LLM Coding Assistant</b></p>
-    <p>Équipe IRA - 2025</p>
-    <p>Pre-Training → Post-Training (SFT) → Alignment (RLHF)</p>
+    <p>Équipe IRA - Nov 2025</p>
+    <p>📊 Pre-Training → 🎯 Post-Training (SFT) → 🎯 Alignment (RLHF)</p>
 </div>
 """, unsafe_allow_html=True)
