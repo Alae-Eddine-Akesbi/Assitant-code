@@ -62,6 +62,9 @@ desktop.ini
 .cache/
 wandb/
 
+# Environment variables
+.env
+
 # Anciens fichiers (si vous voulez les exclure)
 # notebook.ipynb
 # post-training.ipynb
