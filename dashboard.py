@@ -38,7 +38,7 @@ st.markdown("""
         font-size: 3rem;
         font-weight: bold;
         text-align: center;
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 50%, #4facfe 100%);
         -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;
         padding: 20px 0;
@@ -46,40 +46,53 @@ st.markdown("""
     }
     
     .model-card {
-        border-radius: 10px;
+        border-radius: 15px;
         padding: 20px;
         margin: 10px 0;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        transition: transform 0.3s ease;
+        background: white;
+        box-shadow: 0 4px 15px rgba(0, 0, 0, 0.05);
+        transition: transform 0.3s ease, box-shadow 0.3s ease;
         animation: slideIn 0.5s ease-out;
+        border: 1px solid #f0f0f0;
     }
     
     .model-card:hover {
         transform: translateY(-5px);
-        box-shadow: 0 8px 12px rgba(0, 0, 0, 0.2);
+        box-shadow: 0 12px 20px rgba(0, 0, 0, 0.1);
     }
     
     .pre-training {
-        background: linear-gradient(135deg, #667eea22 0%, #764ba222 100%);
-        border-left: 4px solid #667eea;
+        border-top: 5px solid #667eea;
     }
     
     .post-training {
-        background: linear-gradient(135deg, #f093fb22 0% , #f5576c22 100%);
-        border-left: 4px solid #f093fb;
+        border-top: 5px solid #f093fb;
     }
     
     .alignment {
-        background: linear-gradient(135deg, #4facfe22 0%, #00f2fe22 100%);
-        border-left: 4px solid #4facfe;
+        border-top: 5px solid #4facfe;
     }
     
     .metric-box {
-        background: #f0f2f6;
+        background: #f8f9fa;
         border-radius: 8px;
-        padding: 15px;
+        padding: 10px;
         text-align: center;
-        margin: 5px;
+        margin: 5px 0;
+        border: 1px solid #e9ecef;
+    }
+    
+    .metric-label {
+        font-size: 0.8rem;
+        color: #6c757d;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+    }
+    
+    .metric-value {
+        font-size: 1.2rem;
+        font-weight: bold;
+        color: #212529;
     }
     
     .code-output {
@@ -87,11 +100,28 @@ st.markdown("""
         color: #d4d4d4;
         border-radius: 8px;
         padding: 15px;
-        font-family: 'Courier New', monospace;
+        font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
         font-size: 14px;
         line-height: 1.6;
         overflow-x: auto;
-        animation: fadeIn 0.8s ease-in;
+        white-space: pre-wrap;
+        border: 1px solid #333;
+        margin-top: 15px;
+    }
+    
+    .stButton>button {
+        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 10px 20px;
+        font-weight: bold;
+        transition: all 0.3s ease;
+    }
+    
+    .stButton>button:hover {
+        transform: scale(1.02);
+        box-shadow: 0 5px 15px rgba(118, 75, 162, 0.4);
     }
     
     @keyframes fadeIn {
@@ -101,11 +131,11 @@ st.markdown("""
     
     @keyframes slideIn {
         from {
-            transform: translateX(-20px);
+            transform: translateY(20px);
             opacity: 0;
         }
         to {
-            transform: translateX(0);
+            transform: translateY(0);
             opacity: 1;
         }
     }
@@ -272,13 +302,13 @@ def load_model(model_path, tokenizer_path, model_name, device):
     """
     Charge un modèle et son tokenizer avec mise en cache
     Compatible avec les checkpoints des notebooks
-    Gère à la fois Pre-Training et Post-Training (SFT)
+    Gère à la fois Pre-Training, Post-Training (SFT) et Alignment (RLHF)
     """
     try:
         # ====================================================================
         # 1. CHARGER LE TOKENIZER
         # ====================================================================
-        st.write(f"📖 Chargement tokenizer depuis: {tokenizer_path}")
+        # st.write(f"📖 Chargement tokenizer depuis: {tokenizer_path}")
         
         # Vérifier si le chemin existe
         from pathlib import Path
@@ -292,19 +322,19 @@ def load_model(model_path, tokenizer_path, model_name, device):
         try:
             tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         except Exception as e:
-            st.warning(f"⚠️  AutoTokenizer échoué: {str(e)[:80]}...")
-            st.info(f"💡 Essai avec EleutherAI/gpt-neox-20b comme source...")
+            # st.warning(f"⚠️  AutoTokenizer échoué: {str(e)[:80]}...")
+            # st.info(f"💡 Essai avec EleutherAI/gpt-neox-20b comme source...")
             try:
                 # The notebook loads from EleutherAI directly - use that as fallback
                 tokenizer = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b')
-                st.info(f"✅ Tokenizer EleutherAI chargé avec succès")
+                # st.info(f"✅ Tokenizer EleutherAI chargé avec succès")
             except:
-                st.warning(f"⚠️  EleutherAI échoué, essai du pre-training tokenizer...")
+                # st.warning(f"⚠️  EleutherAI échoué, essai du pre-training tokenizer...")
                 try:
                     # Use pre-training tokenizer as final fallback for SFT
                     default_tokenizer_path = "models/pre_training/tokenizer"
                     tokenizer = AutoTokenizer.from_pretrained(default_tokenizer_path)
-                    st.info(f"✅ Tokenizer pre-training utilisé comme fallback")
+                    # st.info(f"✅ Tokenizer pre-training utilisé comme fallback")
                 except:
                     st.error(f"❌ Impossible de charger le tokenizer")
                     return None, None, None, None
@@ -317,12 +347,12 @@ def load_model(model_path, tokenizer_path, model_name, device):
             tokenizer.pad_token = tokenizer.eos_token
         
         vocab_size = len(tokenizer)
-        st.success(f"✅ Tokenizer chargé ({vocab_size:,} tokens)")
+        # st.success(f"✅ Tokenizer chargé ({vocab_size:,} tokens)")
         
         # ====================================================================
         # 2. CHARGER LE CHECKPOINT
         # ====================================================================
-        st.write(f"📦 Chargement checkpoint: {model_path}")
+        # st.write(f"📦 Chargement checkpoint: {model_path}")
         
         # Vérifier si le checkpoint existe
         model_file = Path(model_path)
@@ -333,8 +363,8 @@ def load_model(model_path, tokenizer_path, model_name, device):
         checkpoint = torch.load(model_path, map_location=device)
         
         # Afficher la structure du checkpoint pour debug
-        checkpoint_keys = list(checkpoint.keys()) if isinstance(checkpoint, dict) else ['<direct_tensor>']
-        st.write(f"🔍 Clés du checkpoint: {checkpoint_keys[:10]}...")
+        # checkpoint_keys = list(checkpoint.keys()) if isinstance(checkpoint, dict) else ['<direct_tensor>']
+        # st.write(f"🔍 Clés du checkpoint: {checkpoint_keys[:10]}...")
         
         # Determine vocabulary size from checkpoint if available
         checkpoint_vocab_size = None
@@ -346,13 +376,13 @@ def load_model(model_path, tokenizer_path, model_name, device):
         if checkpoint_vocab_size and checkpoint_vocab_size != vocab_size:
             original_vocab_size = vocab_size
             vocab_size = checkpoint_vocab_size
-            st.info(f"💡 Vocab size ajusté: {original_vocab_size} -> {vocab_size} (depuis checkpoint)")
+            # st.info(f"💡 Vocab size ajusté: {original_vocab_size} -> {vocab_size} (depuis checkpoint)")
         
         # ====================================================================
         # 3. EXTRAIRE LA CONFIGURATION
         # ====================================================================
         # Le checkpoint peut être:
-        # 1. Un dict avec 'model_state_dict' et 'config' (Post-Training)
+        # 1. Un dict avec 'model_state_dict' et 'config' (Post-Training / RLHF)
         # 2. Un dict avec 'model_state_dict' directement (Pre-Training final) 
         # 3. Un dict de poids (weights only - Pre-Training raw)
         
@@ -387,9 +417,9 @@ def load_model(model_path, tokenizer_path, model_name, device):
             block_size=block_size,
         )
         
-        st.write(f"📊 Config du modèle:")
-        st.write(f"   • d_model={config.d_model}, n_heads={config.n_heads}, n_layers={config.n_layers}")
-        st.write(f"   • block_size={config.block_size}, d_ff={config.d_ff}")
+        # st.write(f"📊 Config du modèle:")
+        # st.write(f"   • d_model={config.d_model}, n_heads={config.n_heads}, n_layers={config.n_layers}")
+        # st.write(f"   • block_size={config.block_size}, d_ff={config.d_ff}")
         
         # ====================================================================
         # 4. CRÉER ET CHARGER LE MODÈLE
@@ -407,7 +437,7 @@ def load_model(model_path, tokenizer_path, model_name, device):
                 if old_tok_emb is not None:
                     old_vocab_size = old_tok_emb.shape[0]
                     new_vocab_size = config.vocab_size
-                    st.write(f"   • Ancien vocab: {old_vocab_size}, Nouveau vocab: {new_vocab_size}")
+                    # st.write(f"   • Ancien vocab: {old_vocab_size}, Nouveau vocab: {new_vocab_size}")
                     
                     # Expand embeddings with new tokens
                     new_tok_emb = model.tok_emb.weight.data.clone()
@@ -431,12 +461,13 @@ def load_model(model_path, tokenizer_path, model_name, device):
         model.eval()
         
         total_params = sum(p.numel() for p in model.parameters())
-        st.success(f"✅ Modèle chargé ({total_params:,} paramètres)")
+        # st.success(f"✅ Modèle chargé ({total_params:,} paramètres)")
         
         # ====================================================================
         # 5. EXTRAIRE LES MÉTRIQUES
         # ====================================================================
         history = checkpoint.get('history', {})
+        rlhf_history = checkpoint.get('rlhf_history', {})
         
         # Extraire val_loss et train_loss de manière robuste
         val_loss = 'N/A'
@@ -448,6 +479,11 @@ def load_model(model_path, tokenizer_path, model_name, device):
         train_loss = 'N/A'
         if history and isinstance(history.get('train_loss'), list) and len(history['train_loss']) > 0:
             train_loss = float(history['train_loss'][-1])
+            
+        # RLHF Metrics
+        avg_reward = 'N/A'
+        if rlhf_history and isinstance(rlhf_history.get('avg_rewards'), list) and len(rlhf_history['avg_rewards']) > 0:
+            avg_reward = float(rlhf_history['avg_rewards'][-1])
         
         metrics = {
             'epoch': checkpoint.get('epoch', 'N/A'),
@@ -457,6 +493,7 @@ def load_model(model_path, tokenizer_path, model_name, device):
             'training_stage': checkpoint.get('training_stage', 'unknown'),
             'selected_from_epoch': checkpoint.get('selected_from_epoch', 'N/A'),
             'best_val_loss': checkpoint.get('best_val_loss', 'N/A'),
+            'avg_reward': avg_reward
         }
         
         # Calculer perplexity
@@ -465,7 +502,7 @@ def load_model(model_path, tokenizer_path, model_name, device):
         else:
             metrics['perplexity'] = 'N/A'
         
-        st.success(f"✅ Métriques: val_loss={metrics['val_loss']}, epoch={metrics['epoch']}")
+        # st.success(f"✅ Métriques: val_loss={metrics['val_loss']}, epoch={metrics['epoch']}")
         
         return model, tokenizer, device, metrics
         
@@ -551,34 +588,47 @@ with st.sidebar:
     
     show_pretrained = st.checkbox("✅ Pre-Training", value=True)
     show_sft = st.checkbox("✅ Post-Training (SFT)", value=True)
+    show_alignment = st.checkbox("✅ Alignment (RLHF)", value=True)
     
     st.markdown("---")
     st.markdown("### 📁 Chemins des Modèles")
     
     # Chemins relatifs par défaut (depuis le répertoire courant)
-    pretrained_path = st.text_input(
-        "Pre-Training Model",
-        "models/pre_training/model_final.pt",
-        help="Chemin relatif ou absolu au checkpoint pre-training"
-    )
+    with st.expander("Pre-Training Config", expanded=False):
+        pretrained_path = st.text_input(
+            "Model Path",
+            "models/pre_training/model_final.pt",
+            key="pre_path"
+        )
+        pretrained_tokenizer = st.text_input(
+            "Tokenizer Path",
+            "models/pre_training/tokenizer",
+            key="pre_tok"
+        )
     
-    pretrained_tokenizer = st.text_input(
-        "Pre-Training Tokenizer",
-        "models/pre_training/tokenizer",
-        help="Dossier contenant le tokenizer pre-training"
-    )
-    
-    sft_path = st.text_input(
-        "Post-Training Model",
-        "models/post_training/model_sft_FINAL.pt",
-        help="Chemin relatif ou absolu au checkpoint SFT final"
-    )
-    
-    sft_tokenizer = st.text_input(
-        "Post-Training Tokenizer",
-        "models/post_training/tokenizer",
-        help="Dossier contenant le tokenizer post-training"
-    )
+    with st.expander("Post-Training (SFT) Config", expanded=False):
+        sft_path = st.text_input(
+            "Model Path",
+            "models/post_training/model_sft_FINAL.pt",
+            key="sft_path"
+        )
+        sft_tokenizer = st.text_input(
+            "Tokenizer Path",
+            "models/post_training/tokenizer",
+            key="sft_tok"
+        )
+        
+    with st.expander("Alignment (RLHF) Config", expanded=False):
+        alignment_path = st.text_input(
+            "Model Path",
+            "models/alignment/model_rlhf_aligned.pt",
+            key="rlhf_path"
+        )
+        alignment_tokenizer = st.text_input(
+            "Tokenizer Path",
+            "models/alignment/tokenizer",
+            key="rlhf_tok"
+        )
 
 # ============================================================================
 # MAIN CONTENT - INPUT
@@ -590,7 +640,7 @@ col1, col2 = st.columns([3, 1])
 with col1:
     prompt_input = st.text_area(
         "Prompt",
-        placeholder="Ex: def fibonacci(n):\n\nOu pour SFT: <instruction> Write a function to calculate factorial <reasoning>",
+        placeholder="Ex: def fibonacci(n):\n\nOu pour SFT/RLHF: <instruction> Write a function to calculate factorial <reasoning>",
         height=150,
         label_visibility="collapsed"
     )
@@ -603,7 +653,7 @@ with col2:
         if st.button("Fibonacci"):
             st.session_state.prompt = "def fibonacci(n):"
     with col_ex2:
-        if st.button("Factorial (SFT)"):
+        if st.button("Factorial"):
             st.session_state.prompt = "<instruction> Write a function to calculate factorial <reasoning>"
     
     col_ex3, col_ex4 = st.columns(2)
@@ -629,16 +679,14 @@ if generate_button and prompt_input:
     
     results = {}
     
-    # Container for status
-    status_container = st.container()
-    progress_container = st.container()
+    # Placeholder for status updates (clears previous message)
+    status_placeholder = st.empty()
     
     # ========================================================================
     # MODÈLE 1: PRE-TRAINING
     # ========================================================================
     if show_pretrained:
-        with status_container:
-            st.info("⏳ Chargement Pre-Training...")
+        status_placeholder.info("⏳ Chargement Pre-Training...")
         
         model_pre, tokenizer_pre, device_pre, metrics_pre = load_model(
             pretrained_path,
@@ -648,8 +696,7 @@ if generate_button and prompt_input:
         )
         
         if model_pre is not None:
-            with status_container:
-                st.info("🔄 Génération avec Pre-Training...")
+            status_placeholder.info("🔄 Génération avec Pre-Training...")
             
             generated_pre, time_pre = generate_code(
                 model_pre, tokenizer_pre, device_pre,
@@ -666,8 +713,7 @@ if generate_button and prompt_input:
     # MODÈLE 2: POST-TRAINING (SFT)
     # ========================================================================
     if show_sft:
-        with status_container:
-            st.info("⏳ Chargement Post-Training (SFT)...")
+        status_placeholder.info("⏳ Chargement Post-Training (SFT)...")
         
         model_sft, tokenizer_sft, device_sft, metrics_sft = load_model(
             sft_path,
@@ -677,8 +723,7 @@ if generate_button and prompt_input:
         )
         
         if model_sft is not None:
-            with status_container:
-                st.info("🔄 Génération avec Post-Training...")
+            status_placeholder.info("🔄 Génération avec Post-Training...")
             
             generated_sft, time_sft = generate_code(
                 model_sft, tokenizer_sft, device_sft,
@@ -690,10 +735,36 @@ if generate_button and prompt_input:
                 'time': time_sft,
                 'metrics': metrics_sft
             }
+            
+    # ========================================================================
+    # MODÈLE 3: ALIGNMENT (RLHF)
+    # ========================================================================
+    if show_alignment:
+        status_placeholder.info("⏳ Chargement Alignment (RLHF)...")
+        
+        model_rlhf, tokenizer_rlhf, device_rlhf, metrics_rlhf = load_model(
+            alignment_path,
+            alignment_tokenizer,
+            "Alignment (RLHF)",
+            device
+        )
+        
+        if model_rlhf is not None:
+            status_placeholder.info("🔄 Génération avec Alignment (RLHF)...")
+            
+            generated_rlhf, time_rlhf = generate_code(
+                model_rlhf, tokenizer_rlhf, device_rlhf,
+                prompt_input, max_tokens, temperature, top_k
+            )
+            
+            results['rlhf'] = {
+                'output': generated_rlhf,
+                'time': time_rlhf,
+                'metrics': metrics_rlhf
+            }
     
     # Clear status
-    status_container.empty()
-    progress_container.empty()
+    status_placeholder.empty()
     
     if results:
         st.success("✅ Génération terminée !")
@@ -706,6 +777,7 @@ if generate_button and prompt_input:
         model_styles = {
             'pre': ('pre-training', '🔵 Pre-Training', '#667eea'),
             'sft': ('post-training', '🟣 Post-Training (SFT)', '#f093fb'),
+            'rlhf': ('alignment', '🟢 Alignment (RLHF)', '#4facfe'),
         }
         
         cols = st.columns(len(results))
@@ -722,21 +794,31 @@ if generate_button and prompt_input:
                 
                 col_m1, col_m2 = st.columns(2)
                 with col_m1:
-                    st.metric("⏱️ Temps", f"{result['time']:.3f}s")
-                    st.metric("📅 Epoch", str(metrics['epoch']))
-                
+                    st.markdown(f"""
+                    <div class="metric-box">
+                        <div class="metric-label">Temps</div>
+                        <div class="metric-value">{result['time']:.3f}s</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
                 with col_m2:
                     val_loss = metrics.get('val_loss')
-                    if isinstance(val_loss, float):
-                        st.metric("📉 Val Loss", f"{val_loss:.4f}")
-                    else:
-                        st.metric("📉 Val Loss", "N/A")
-                    
-                    perp = metrics.get('perplexity')
-                    if isinstance(perp, float):
-                        st.metric("🎯 Perplexity", f"{perp:.2f}")
-                    else:
-                        st.metric("🎯 Perplexity", "N/A")
+                    loss_display = f"{val_loss:.4f}" if isinstance(val_loss, float) else "N/A"
+                    st.markdown(f"""
+                    <div class="metric-box">
+                        <div class="metric-label">Val Loss</div>
+                        <div class="metric-value">{loss_display}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                
+                # Additional metrics if available
+                if model_key == 'rlhf' and isinstance(metrics.get('avg_reward'), float):
+                     st.markdown(f"""
+                    <div class="metric-box">
+                        <div class="metric-label">Avg Reward</div>
+                        <div class="metric-value">{metrics['avg_reward']:.4f}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
                 
                 # Stage info
                 st.caption(f"Stage: {metrics.get('training_stage', 'N/A')}")
@@ -783,11 +865,11 @@ if generate_button and prompt_input:
                 m = result['metrics']
                 val_loss = m.get('val_loss')
                 perp = m.get('perplexity')
-                if isinstance(val_loss, float) and isinstance(perp, float):
+                if isinstance(val_loss, float):
                     metrics_data.append({
                         'Modèle': title,
                         'Validation Loss': val_loss,
-                        'Perplexity': perp
+                        'Perplexity': perp if isinstance(perp, float) else 0
                     })
             
             if metrics_data:
@@ -798,7 +880,8 @@ if generate_button and prompt_input:
                         metrics_data,
                         x='Modèle',
                         y='Validation Loss',
-                        title='📉 Validation Loss'
+                        title='📉 Validation Loss',
+                        color='Modèle'
                     )
                     st.plotly_chart(fig_loss, use_container_width=True)
                 
@@ -807,7 +890,8 @@ if generate_button and prompt_input:
                         metrics_data,
                         x='Modèle',
                         y='Perplexity',
-                        title='🎯 Perplexity'
+                        title='🎯 Perplexity',
+                        color='Modèle'
                     )
                     st.plotly_chart(fig_perp, use_container_width=True)
         
@@ -828,7 +912,8 @@ if generate_button and prompt_input:
                     length_data,
                     x='Modèle',
                     y='Caractères',
-                    title='📏 Longueur en Caractères'
+                    title='📏 Longueur en Caractères',
+                    color='Modèle'
                 )
                 st.plotly_chart(fig_chars, use_container_width=True)
             
@@ -837,7 +922,8 @@ if generate_button and prompt_input:
                     length_data,
                     x='Modèle',
                     y='Lignes',
-                    title='📄 Nombre de Lignes'
+                    title='📄 Nombre de Lignes',
+                    color='Modèle'
                 )
                 st.plotly_chart(fig_lines, use_container_width=True)
 
@@ -849,6 +935,6 @@ st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
     <p>🧠 <b>Workshop LLM Coding Assistant</b></p>
     <p>Équipe IRA - Nov 2025</p>
-    <p>📊 Pre-Training → 🎯 Post-Training (SFT) → 🎯 Alignment (RLHF)</p>
+    <p>📊 Pre-Training → 🎯 Post-Training (SFT) → 🟢 Alignment (RLHF)</p>
 </div>
 """, unsafe_allow_html=True)
